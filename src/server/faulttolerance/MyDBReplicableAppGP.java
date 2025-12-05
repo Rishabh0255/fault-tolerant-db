@@ -1,8 +1,10 @@
 package server.faulttolerance;
 
 import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.Session;
 import edu.umass.cs.gigapaxos.interfaces.Replicable;
 import edu.umass.cs.gigapaxos.interfaces.Request;
+import edu.umass.cs.gigapaxos.paxospackets.RequestPacket;
 import edu.umass.cs.nio.interfaces.IntegerPacketType;
 import edu.umass.cs.nio.interfaces.NodeConfig;
 import edu.umass.cs.nio.nioutils.NIOHeader;
@@ -13,6 +15,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.logging.Logger;
 
 /**
  * This class should implement your {@link Replicable} database app if you wish
@@ -39,6 +42,8 @@ import java.util.Set;
  */
 public class MyDBReplicableAppGP implements Replicable {
 
+	private static final Logger log = Logger.getLogger(MyDBReplicableAppGP.class.getName());
+
 	/**
 	 * Set this value to as small a value with which you can get tests to still
 	 * pass. The lower it is, the faster your implementation is. Grader* will
@@ -47,6 +52,14 @@ public class MyDBReplicableAppGP implements Replicable {
 	 * is not necessarily better, so don't sweat speed. Focus on safety.
 	 */
 	public static final int SLEEP = 1000;
+
+	//cassandra
+	private Session session;
+	private Cluster cluster;
+	private String keyspace;
+
+	private int requestCount = 0;
+	private static final int CHECKPOINT_INTERVAL = 100;
 
 	/**
 	 * All Gigapaxos apps must either support a no-args constructor or a
@@ -61,7 +74,51 @@ public class MyDBReplicableAppGP implements Replicable {
 	 */
 	public MyDBReplicableAppGP(String[] args) throws IOException {
 		// TODO: setup connection to the data store and keyspace
-		throw new RuntimeException("Not yet implemented");
+
+		if (args == null || args.length == 0) {
+			throw new IllegalArgumentException("Keyspace name required");
+		}
+
+		this.keyspace = args[0];
+
+		//parse the adress
+		InetSocketAddress address;
+
+		if (args.length > 1) {
+			String[] parts = args[1].split(":");
+			address = new InetSocketAddress(parts[0], Integer.parseInt(parts[1]));
+		} else {
+			address = new InetSocketAddress("localhost", 9042);
+		}
+
+		//connect to cassandra
+		try {
+			cluster = Cluster.builder().addContactPoint(address.getHostString()).withPort(address.getPort()).build();
+			session = cluster.connect();
+
+			createKeyspaceIfNeeded();
+
+			log.info("Connected to Cassandra for keyspace:" + keyspace);
+
+		} catch (Exception e) {
+			log.severe("Failed to connect to Cassandra:" + e.getMessage());
+			throw new IOException(e);
+		}
+	}
+
+	private void createKeyspaceIfNeeded() {
+		try {
+			session.execute(
+				"CREATE KEYSPACE IF NOT EXISTS" + keyspace +
+				" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
+			);
+
+			session.execute("USE " + keyspace);
+
+		} catch (Exception e) {
+
+			log.warning("Keyspace creation failed:" + e.getMessage());
+		}
 	}
 
 	/**
@@ -78,7 +135,40 @@ public class MyDBReplicableAppGP implements Replicable {
 	@Override
 	public boolean execute(Request request, boolean b) {
 		// TODO: submit request to data store
-		throw new RuntimeException("Not yet implemented");
+
+		if (request == null) {
+			return false;
+		}
+
+		try {
+			String command = extractCommand(request);
+
+			if (command == null || command.trim().isEmpty()) {
+				return true;
+			}
+
+			if (command.trim().startsWith("{")) {
+				return true;
+			}
+
+			//execute command
+			session.execute(command);
+
+			//Track requests
+			if (!b) {
+				requestCount++;
+
+				if (requestCount % CHECKPOINT_INTERVAL == 0) {
+					log.fine("Executed " + requestCount + " request, checkpoint is recommended");
+				}
+			}
+
+			return true;
+
+		} catch (Exception e) {
+			log.warning("Failed to execute request: " + e.getMessage());
+			return false;
+		}
 	}
 
 	/**
@@ -91,7 +181,22 @@ public class MyDBReplicableAppGP implements Replicable {
 	@Override
 	public boolean execute(Request request) {
 		// TODO: execute the request by sending it to the data store
-		throw new RuntimeException("Not yet implemented");
+		return execute(request, false);
+	}
+
+	//Extract the CQL command from the request
+	private String extractCommand(Request request) {
+		if (request instanceof RequestPacket) {
+			RequestPacket packet = (RequestPacket) request;
+
+			return packet.requestValue;
+		}
+
+		if (request != null) {
+			return request.toString();
+		}
+
+		return null;
 	}
 
 	/**
@@ -103,7 +208,18 @@ public class MyDBReplicableAppGP implements Replicable {
 	@Override
 	public String checkpoint(String s) {
 		// TODO:
-		throw new RuntimeException("Not yet implemented");
+		try {
+			String checkpointData = "CHECKPOINT:" + keyspace + ":" + requestCount;
+			log.info("Creating checkpoint for " + s + " - " + checkpointData);
+			
+			return checkpointData;
+
+		} catch (Exception e) {
+
+			log.severe("Checkpoint failed: " + e.getMessage());
+
+			return null;
+		}
 	}
 
 	/**
@@ -116,8 +232,30 @@ public class MyDBReplicableAppGP implements Replicable {
 	@Override
 	public boolean restore(String s, String s1) {
 		// TODO:
-		throw new RuntimeException("Not yet implemented");
 
+		try {
+			if (s1 == null || s1.trim().isEmpty()) {
+				log.info("Restoring to empty initial state for " + s);
+				requestCount = 0;
+				return true;
+			}
+
+			//Parse checkpoint data
+			if (s1.startsWith("CHECKPOINT:")) {
+				String[] parts = s1.split(":");
+				if (parts.length >= 3) {
+					requestCount = Integer.parseInt(parts[2]);
+				}
+			}
+
+			log.info("Restored from checkpoint for " + s + "at request count " + requestCount);
+
+			return true;
+
+		} catch (Exception e) {
+			log.severe("Restore failed: " + e.getMessage());
+			return false;
+		}
 	}
 
 
