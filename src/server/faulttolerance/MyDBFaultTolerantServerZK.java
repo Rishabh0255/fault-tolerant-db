@@ -137,29 +137,7 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				}
 			}
 			
-			//Replay proposals after the checkpoint
-			List<String> proposals = zk.getChildren("/proposals", false);
-			Collections.sort(proposals);
-
-			for(String p: proposals){
-				if (lastExecuted != null && p.compareTo(lastExecuted) <= 0) continue;
-
-				byte[] data = zk.getData("/proposals/" + p, false, null);
-
-				if(data != null &&data.length> 0){
-					String s = new String(data, StandardCharsets.UTF_8);
-					JSONObject obj = new JSONObject(s);
-					String cmd = obj.getString("cmd");
-
-					if (!cmd.trim().startsWith("{")) {
-						cassandraSession.execute(cmd);
-						executedCount++;
-					}
-
-					lastExecuted = p;
-				}
-			}
-			
+			//Set up watcher 1st to avoid missing proposals
 			Watcher proposalWatcher = new Watcher() {
 				public void process(WatchedEvent event) {
 					if(event.getType() == Event.EventType.NodeChildrenChanged) {
@@ -192,11 +170,6 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 										} catch (IOException ex) {}
 									}
 
-									try {
-										zk.delete("/proposals/" + p, -1);
-
-									} catch (KeeperException.NoNodeException e) {}
-
 									lastExecuted = p;
 
 									if (executedCount > 0 && executedCount % 100 == 0) {
@@ -205,14 +178,6 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 										cp.put("last", lastExecuted);
 										byte[] cpData = cp.toString().getBytes(StandardCharsets.UTF_8);
 										zk.setData("/checkpoint", cpData, -1);
-										
-										for (String old : ps) {
-											if (old.compareTo(lastExecuted) < 0) {
-												try {
-													zk.delete("/proposals/" + old, -1);
-												} catch (Exception ex) {}
-											}
-										}
 									}
 								}
 							}
@@ -225,7 +190,27 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 				}
 			};
 
-			zk.getChildren("/proposals", proposalWatcher);
+			List<String> initialProposals = zk.getChildren("/proposals", proposalWatcher);
+			Collections.sort(initialProposals);
+			
+			//process any proposals we missed
+			for(String p: initialProposals){
+				if (lastExecuted != null && p.compareTo(lastExecuted) <= 0) continue;
+
+				byte[] data = zk.getData("/proposals/" + p, false, null);
+				if(data != null && data.length > 0){
+					String s = new String(data, StandardCharsets.UTF_8);
+					JSONObject obj = new JSONObject(s);
+					String cmd = obj.getString("cmd");
+
+					if (!cmd.trim().startsWith("{")) {
+						cassandraSession.execute(cmd);
+						executedCount++;
+					}
+
+					lastExecuted = p;
+				}
+			}
 			
 		} catch (Exception e) {
 			throw new IOException(e);
