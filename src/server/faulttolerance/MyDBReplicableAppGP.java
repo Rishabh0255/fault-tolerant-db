@@ -109,7 +109,7 @@ public class MyDBReplicableAppGP implements Replicable {
 	private void createKeyspaceIfNeeded() {
 		try {
 			session.execute(
-				"CREATE KEYSPACE IF NOT EXISTS" + keyspace +
+				"CREATE KEYSPACE IF NOT EXISTS " + keyspace +
 				" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
 			);
 
