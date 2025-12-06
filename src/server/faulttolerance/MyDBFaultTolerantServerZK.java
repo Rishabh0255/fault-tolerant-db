@@ -9,6 +9,16 @@ import server.ReplicatedServer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+
+import com.datastax.driver.core.Cluster;
+import com.datastax.driver.core.Session;
+import org.apache.zookeeper.*;
+import org.apache.zookeeper.data.Stat;
+import org.json.JSONObject;
 
 /**
  * This class should implement your replicated fault-tolerant database server if
@@ -56,6 +66,16 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 
 	public static final int DEFAULT_PORT = 2181;
 
+	// Zookeeper connection and state
+	private ZooKeeper zk;
+	private Session cassandraSession;
+	private Cluster cassandraCluster;
+	private String keyspace;
+	private Map<Long, InetSocketAddress> pendingRequests = new ConcurrentHashMap<>();
+	private long requestID = 0;
+	private int executedCount = 0;
+	private String lastExecuted = null;
+
 	/**
 	 * @param nodeConfig Server name/address configuration information read
 	 *                      from
@@ -74,20 +94,175 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 						.SERVER_PORT_OFFSET), isaDB, myID);
 
 		// TODO: Make sure to do any needed crash recovery here.
+		this.keyspace = myID;
+		
+		try {
+			//connect to cassandra
+			cassandraCluster = Cluster.builder().addContactPoint(isaDB.getHostString()).withPort(isaDB.getPort()).build();
+			cassandraSession = cassandraCluster.connect();
+			cassandraSession.execute(
+				"CREATE KEYSPACE IF NOT EXISTS " + keyspace +
+				" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
+			);
+			cassandraSession.execute("USE " + keyspace);
+			
+			// connect to Zookeeper
+			CountDownLatch latch = new CountDownLatch(1);
+			zk = new ZooKeeper("localhost:2181", 30000, event -> {
+				if (event.getState() == Watcher.Event.KeeperState.SyncConnected) {
+					latch.countDown();
+				}
+			});
+
+			latch.await();
+			
+			//Ensure znodes exist
+			try {
+				zk.create("/proposals", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+			} catch (KeeperException.NodeExistsException e) {}
+			
+			try {
+				zk.create("/checkpoint", new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+			} catch (KeeperException.NodeExistsException e) {}
+			
+			//Crash recovery
+			Stat stat = zk.exists("/checkpoint", false);
+			if (stat != null && stat.getDataLength() > 0) {
+				byte[] data = zk.getData("/checkpoint", false, null);
+				if (data != null && data.length > 0) {
+					String s = new String(data, StandardCharsets.UTF_8);
+					JSONObject cp = new JSONObject(s);
+					executedCount = cp.getInt("count");
+					lastExecuted = cp.optString("last", null);
+				}
+			}
+			
+			//Replay proposals after the checkpoint
+			List<String> proposals = zk.getChildren("/proposals", false);
+			Collections.sort(proposals);
+
+			for(String p: proposals){
+				if (lastExecuted != null && p.compareTo(lastExecuted) <= 0) continue;
+
+				byte[] data = zk.getData("/proposals/" + p, false, null);
+
+				if(data != null &&data.length> 0){
+					String s = new String(data, StandardCharsets.UTF_8);
+					JSONObject obj = new JSONObject(s);
+					String cmd = obj.getString("cmd");
+
+					if (!cmd.trim().startsWith("{")) {
+						cassandraSession.execute(cmd);
+						executedCount++;
+					}
+
+					lastExecuted = p;
+				}
+			}
+			
+			Watcher proposalWatcher = new Watcher() {
+				public void process(WatchedEvent event) {
+					if(event.getType() == Event.EventType.NodeChildrenChanged) {
+						try {
+							List<String> ps = zk.getChildren("/proposals", this);
+							Collections.sort(ps);
+							for (String p: ps) {
+								if (lastExecuted != null && p.compareTo(lastExecuted) <= 0) continue;
+								byte[] d = zk.getData("/proposals/" + p, false, null);
+								if (d != null && d.length > 0) {
+									String str = new String(d, StandardCharsets.UTF_8);
+									JSONObject o = new JSONObject(str);
+									long rid = o.getLong("rid");
+									String cmd = o.getString("cmd");
+
+									if (!cmd.trim().startsWith("{")) {
+										cassandraSession.execute(cmd);
+										executedCount++;
+									}
+
+									if (pendingRequests.containsKey(rid)) {
+										InetSocketAddress addr = pendingRequests.remove(rid);
+										JSONObject resp = new JSONObject();
+										resp.put("rid", rid);
+										resp.put("status", "ok");
+
+										try {
+											clientMessenger.send(addr, resp.toString().getBytes(StandardCharsets.UTF_8));
+										
+										} catch (IOException ex) {}
+									}
+
+									try {
+										zk.delete("/proposals/" + p, -1);
+
+									} catch (KeeperException.NoNodeException e) {}
+
+									lastExecuted = p;
+
+									if (executedCount > 0 && executedCount % 100 == 0) {
+										JSONObject cp = new JSONObject();
+										cp.put("count", executedCount);
+										cp.put("last", lastExecuted);
+										byte[] cpData = cp.toString().getBytes(StandardCharsets.UTF_8);
+										zk.setData("/checkpoint", cpData, -1);
+										
+										for (String old : ps) {
+											if (old.compareTo(lastExecuted) < 0) {
+												try {
+													zk.delete("/proposals/" + old, -1);
+												} catch (Exception ex) {}
+											}
+										}
+									}
+								}
+							}
+
+							zk.getChildren("/proposals", this);
+
+						} catch (Exception e) {}
+
+					}
+				}
+			};
+
+			zk.getChildren("/proposals", proposalWatcher);
+			
+		} catch (Exception e) {
+			throw new IOException(e);
+
+		}
 	}
 
 	/**
 	 * TODO: process bytes received from clients here.
 	 */
 	protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
-		throw new RuntimeException("Not implemented");
+		//create proposal in Zookeeper with sequential node
+
+		try {
+			String cmd = new String(bytes, StandardCharsets.UTF_8);
+			long rid = requestID++;
+			pendingRequests.put(rid, header.sndr);
+			
+			JSONObject obj = new JSONObject();
+			obj.put("rid", rid);
+			obj.put("cmd", cmd);
+			
+			zk.create(
+				"/proposals/prop-",
+				obj.toString().getBytes(StandardCharsets.UTF_8),
+				ZooDefs.Ids.OPEN_ACL_UNSAFE,
+				CreateMode.PERSISTENT_SEQUENTIAL
+			);
+		} catch (Exception e) {}
+
 	}
 
 	/**
 	 * TODO: process bytes received from fellow servers here.
 	 */
 	protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
-		throw new RuntimeException("Not implemented");
+		// Not needed
 	}
 
 
@@ -95,7 +270,15 @@ public class MyDBFaultTolerantServerZK extends server.MyDBSingleServer {
 	 * TODO: Gracefully close any threads or messengers you created.
 	 */
 	public void close() {
-		throw new RuntimeException("Not implemented");
+		try {
+			if(zk != null) zk.close();
+			if (cassandraSession != null) cassandraSession.close();
+			if (cassandraCluster != null) cassandraCluster.close();
+
+		} catch (Exception e) {}
+
+		super.close();
+
 	}
 
 	public static enum CheckpointRecovery {
